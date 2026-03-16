@@ -13,21 +13,19 @@ class Graph[K, V]:
         self.nodes[key] = value
 
     def add_edge(self, from_key: K, to_key: K) -> None:
+        if from_key not in self.nodes:
+            raise ValueError(f"Node {from_key} does not exist")
+        if to_key not in self.nodes:
+            raise ValueError(f"Node {to_key} does not exist")
+
         self.edges.setdefault(from_key, []).append(to_key)
-
-    def get_node_connected_edges(self, key: K) -> list[K]:
-        return [edge for edge in self.edges.get(key, []) if edge in self.nodes]
-
-    @property
-    def connected_edges(self) -> dict[K, list[K]]:
-        return {key: self.get_node_connected_edges(key) for key in self.nodes}
 
     def topological_sort(self) -> Generator[K]:
         # Kahn's algorithm for topological sorting
 
         # For each node, count the number of incoming edges
         incoming_count: dict[K, int] = dict.fromkeys(self.nodes, 0)
-        for to_keys in self.connected_edges.values():
+        for to_keys in self.edges.values():
             for to_key in to_keys:
                 incoming_count[to_key] += 1
 
@@ -47,7 +45,7 @@ class Graph[K, V]:
 
             # Then, for each node connected to the current node, decrement the incoming
             # count and if the incoming count is now 0, add the node to the queue.
-            for to_key in self.get_node_connected_edges(node):
+            for to_key in self.edges.get(node, []):
                 incoming_count[to_key] -= 1
                 if incoming_count[to_key] == 0:
                     queue.append(to_key)

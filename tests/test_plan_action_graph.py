@@ -50,6 +50,11 @@ class IngredientTarget(KindTarget[Literal["ingredient"], Ingredient]):
         super().__init__("ingredient", store)
 
 
+class ReplaceOnlyIngredientTarget(IngredientTarget):
+    def can_update(self, current: Ingredient, desired: Ingredient) -> bool:  # noqa: ARG002
+        return False
+
+
 class RecipeTarget(KindTarget[Literal["recipe"], Recipe]):
     def __init__(self, store: list[Recipe]):
         super().__init__("recipe", store)
@@ -133,6 +138,32 @@ class PlanActionGraphTests(unittest.TestCase):
         self.assertIsInstance(planned[1], UpdateStep)
         self.assertEqual(planned[0].resource["name"], "jam")
         self.assertEqual(planned[1].desired["name"], "toast")
+
+    def test_replaced_dependency_forces_dependant_replace(self) -> None:
+        ingredients: list[Ingredient] = [
+            {"kind": "ingredient", "name": "milk", "revision": 1},
+        ]
+        recipes: list[Recipe] = [
+            {"kind": "recipe", "name": "pancake", "ingredients": ["milk"]},
+        ]
+
+        planned = plan(
+            desired=[
+                {"kind": "ingredient", "name": "milk", "revision": 2},
+                {"kind": "recipe", "name": "pancake", "ingredients": ["milk"]},
+            ],
+            targets=[ReplaceOnlyIngredientTarget(ingredients), RecipeTarget(recipes)],
+        )
+
+        self.assertEqual(len(planned), 4)
+        self.assertIsInstance(planned[0], DeleteStep)
+        self.assertIsInstance(planned[1], DeleteStep)
+        self.assertIsInstance(planned[2], CreateStep)
+        self.assertIsInstance(planned[3], CreateStep)
+        self.assertEqual(planned[0].resource["name"], "pancake")
+        self.assertEqual(planned[1].resource["name"], "milk")
+        self.assertEqual(planned[2].resource["name"], "milk")
+        self.assertEqual(planned[3].resource["name"], "pancake")
 
 
 if __name__ == "__main__":

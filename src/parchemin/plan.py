@@ -84,6 +84,8 @@ def plan(desired: Iterable[object], targets: Iterable[Target]) -> Plan:
 
     current_graph: Graph[Hashable, Resource] = Graph()
     desired_graph: Graph[Hashable, Resource] = Graph()
+    current_dependencies: dict[Hashable, set[Hashable]] = {}
+    desired_dependencies: dict[Hashable, set[Hashable]] = {}
 
     for desired_item in desired:
         for target in targets:
@@ -125,49 +127,140 @@ def plan(desired: Iterable[object], targets: Iterable[Target]) -> Plan:
 
     for resource in resources.values():
         if resource.current is not None:
-            for dependency_key in resource.target.depends_on(resource.current):
+            current_dependencies[resource.key] = set(
+                resource.target.depends_on(resource.current)
+            )
+            for dependency_key in current_dependencies[resource.key]:
                 current_graph.add_edge(dependency_key, resource.key)
 
         if resource.desired is not None:
-            for dependency_key in resource.target.depends_on(resource.desired):
+            desired_dependencies[resource.key] = set(
+                resource.target.depends_on(resource.desired)
+            )
+            for dependency_key in desired_dependencies[resource.key]:
                 desired_graph.add_edge(dependency_key, resource.key)
 
     for key in current_graph.topological_sort():
         resource = resources[key]
-        print(f"{key}: {resource.decision}")
         for dependency_key in current_graph.edges.get(key, []):
             dependency = resources[dependency_key]
-            print("  -", dependency_key, ":", dependency.decision)
             if resource.decision in [
                 "create",
                 "replace",
             ] and dependency.decision not in ["create", "replace", "delete"]:
                 dependency.decision = "replace"
-                print("   -> replace")
-            elif resource.decision == "delete" and dependency.decision != "delete":
+
+    # Build an action graph where each node is an executable step.
+    # The topological order of this graph is the final execution plan.
+    ActionKey = tuple[Literal["create", "update", "delete"], Hashable]
+    action_graph: Graph[ActionKey, Step] = Graph()
+    delete_actions: dict[Hashable, ActionKey] = {}
+    create_actions: dict[Hashable, ActionKey] = {}
+    update_actions: dict[Hashable, ActionKey] = {}
+
+    for key, resource in resources.items():
+        if resource.decision == "delete":
+            if resource.current is None:
+                raise ValueError(f"Resource {key!r} cannot be deleted: missing current")
+            action_key: ActionKey = ("delete", key)
+            delete_actions[key] = action_key
+            action_graph.add_node(action_key, DeleteStep(resource.target, resource.current))
+            continue
+
+        if resource.decision == "create":
+            if resource.desired is None:
+                raise ValueError(f"Resource {key!r} cannot be created: missing desired")
+            action_key = ("create", key)
+            create_actions[key] = action_key
+            action_graph.add_node(action_key, CreateStep(resource.target, resource.desired))
+            continue
+
+        if resource.decision == "update":
+            if resource.current is None or resource.desired is None:
+                raise ValueError(f"Resource {key!r} cannot be updated")
+            action_key = ("update", key)
+            update_actions[key] = action_key
+            action_graph.add_node(
+                action_key, UpdateStep(resource.target, resource.current, resource.desired)
+            )
+            continue
+
+        if resource.decision == "replace":
+            if resource.current is None or resource.desired is None:
+                raise ValueError(f"Resource {key!r} cannot be replaced")
+
+            delete_key: ActionKey = ("delete", key)
+            create_key: ActionKey = ("create", key)
+            delete_actions[key] = delete_key
+            create_actions[key] = create_key
+            action_graph.add_node(delete_key, DeleteStep(resource.target, resource.current))
+            action_graph.add_node(create_key, CreateStep(resource.target, resource.desired))
+            action_graph.add_edge(delete_key, create_key)
+
+    # Current dependency edges: dependency -> dependant
+    # If dependency is deleted, dependant must first stop depending on it.
+    for dependency_key, dependant_keys in current_graph.edges.items():
+        if dependency_key not in delete_actions:
+            continue
+
+        dependency_delete_action = delete_actions[dependency_key]
+
+        for dependant_key in dependant_keys:
+            dependant = resources[dependant_key]
+
+            if dependant.decision in ["delete", "replace"]:
+                detach_action = delete_actions[dependant_key]
+                action_graph.add_edge(detach_action, dependency_delete_action)
+                continue
+
+            if dependant.decision == "update":
+                still_depends_after_update = dependency_key in desired_dependencies.get(
+                    dependant_key, set()
+                )
+                if still_depends_after_update:
+                    raise ValueError(
+                        f"Resource {dependency_key!r} is scheduled for deletion, "
+                        f"but resource {dependant_key!r} still depends on it after update."
+                    )
+
+                detach_action = update_actions[dependant_key]
+                action_graph.add_edge(detach_action, dependency_delete_action)
+                continue
+
+            if dependant.decision == "noop":
                 raise ValueError(
-                    f"Resource {key} is scheduled for deletion, "
-                    "but dependency {dependency_key} is in a state that prevents it."
+                    f"Resource {dependency_key!r} is scheduled for deletion, "
+                    f"but resource {dependant_key!r} still depends on it."
                 )
 
-    steps: list[Step] = []
-
-    # Delete phase
-    for key in current_graph.topological_sort():
-        resource = resources[key]
-        if resource.decision == "delete" or resource.decision == "replace":
-            steps.insert(0, DeleteStep(resource.target, resource.current))
-
-    # Create phase
-    for key in desired_graph.topological_sort():
-        resource = resources[key]
-        if resource.decision == "create" or resource.decision == "replace":
-            steps.append(CreateStep(resource.target, resource.desired))
-        elif resource.decision == "update":
-            steps.append(
-                UpdateStep(resource.target, resource.current, resource.desired)
+    # Desired dependency edges: dependency -> dependant
+    # If dependency is created/replaced, dependant action that realizes desired state
+    # must run after dependency creation.
+    for dependency_key, dependant_keys in desired_graph.edges.items():
+        dependency = resources[dependency_key]
+        if dependency.decision == "delete":
+            raise ValueError(
+                f"Resource {dependency_key!r} is scheduled for deletion, "
+                "but desired state still depends on it."
             )
 
+        dependency_ready_action = create_actions.get(dependency_key)
+        if dependency_ready_action is None:
+            continue
+
+        for dependant_key in dependant_keys:
+            dependant = resources[dependant_key]
+
+            if dependant.decision == "update":
+                dependant_action = update_actions[dependant_key]
+            elif dependant.decision in ["create", "replace"]:
+                dependant_action = create_actions[dependant_key]
+            else:
+                continue
+
+            action_graph.add_edge(dependency_ready_action, dependant_action)
+
+    steps = [action_graph.nodes[action_key] for action_key in action_graph.topological_sort()]
     return Plan(steps)
 
 
